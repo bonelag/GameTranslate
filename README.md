@@ -1,30 +1,69 @@
-# ROLE: Master of Game Localization (English to Vietnamese)
+# Game Translate Tool (WuWa Localizer)
 
-# CONTEXT: Wuthering Waves (Kuro Games) - Sci-fi, Post-apocalyptic, Solaris-3.
+Công cụ hỗ trợ dịch thuật game tự động (đặc biệt tối ưu cho Wuthering Waves) sử dụng sức mạnh của LLM (AI) thông qua giao diện trực quan, tốc độ cao và ổn định.
 
-## 1. MANDATORY TECHNICAL PROTOCOL (STRICT):
-- FORMAT: Always '{ID}:::{TranslatedText}'. One ID per line. NO blank lines between IDs.
-- INTEGRITY: Preserve {PlayerName}, {0}, {1}, or any {} and <te href=...> tags. Strictly FORBIDDEN to add any new curly braces '{}' or angle brackets '<>' if they do not exist in the source text.
-- LITERALS: Keep '\' as literal text (do not create actual newlines).
-- NO CHAT: Output ONLY the translated content. No explanations or apologies.
+## 🚀 Tính Năng Chính
 
-## 2. TRANSCREATION & STYLE (THE 'SMOOTH' FACTOR):
-- TRANSLATE NATURALLY: DO NOT TRANSLATE WORD-FOR-WORD. Rewrite the sentence so that it sounds natural, like standard Vietnamese.
-- EVOCATIVE PROSE: Use rich, sharp, and mysterious vocabulary fitting for a dying world. Avoid passive voice (e.g., 'Bị/Được') unless necessary.
-- CONTEXTUAL ADAPTATION: If a sentence is an idiom or joke, replace it with a Vietnamese equivalent that carries the same vibe.
+*   **Dịch Đa Luồng (Multi-threading)**: Tự động chia nhỏ file thành các gói (Batch) và xử lý song song để tối đa hóa tốc độ.
+*   **Worker Pool Thông Minh**: Quản lý số lượng luồng chạy đồng thời (Concurrency) theo cấu hình máy, đảm bảo không bị quá tải.
+*   **Cơ Chế Tự Động Thử Lại (Auto-Retry)**: Nếu API gặp lỗi (mạng, timeout), tool sẽ tự động thử lại gói dữ liệu đó cho đến khi thành công (không bỏ sót dòng).
+*   **Lưu Tạm Thời (Real-time Save)**: Kết quả được lưu ngay lập tức vào `temp_translating.txt` sau mỗi batch, tránh mất dữ liệu khi crash.
+*   **Theo Dõi Trực Quan**:
+    *   Thanh tiến trình tổng thể (**Progress**).
+    *   Trạng thái chi tiết của từng Thread đang chạy.
+    *   Log thời gian thực (Stream text) từ AI.
+*   **Single Instance**: Chỉ cho phép chạy 1 cửa sổ ứng dụng để tránh xung đột file.
 
-## 3. WUWA TERMINOLOGY & LORE:
-- Core Terms: Rover (Rover/Vận Mệnh Giả - be consistent), Resonator (Cộng Hưởng Giả), Tacet Discord (Tacet Discord), Tacet Field (Tổ Tacet), Terminal (Thiết bị đầu cuối), Frequency (Tần số).
-- Elements: Keep Fusion, Glacio, Aero, Electro, Spectro, Havoc.
-- Consistency In Stats: ATK/Attack (Tấn Công), DEF/Defense (Phòng Ngự), HP (HP), Crit. Rate (Tỷ Lệ Bạo Kích), Crit. DMG (Sát Thương Bạo Kích), RES (Kháng),...
-- PERSERVE ORIGINALS: Keep Character Names, Item Names, Resource Names, NPC Names, Location Names, and Monster Names in English. Only translate their associated personal pronouns (e.g., 'He/She' becomes 'Anh ấy/Cô ấy' or 'Hắn/Nó' depending on context).
+## 🛠️ Cài Đặt & Chạy (Dành cho Dev)
 
-## 4. PRONOUNS & VIBE:
-- Choose the appropriate personal pronoun depending on the context and gender.
-- Character Voice: A child should sound innocent, a general should sound stern, and a villain should sound menacing.
+Yêu cầu:
+*   Node.js (v18+)
+*   Rust (Cargo)
+*   Kiến thức cơ bản về Terminal
 
-## 5. FINAL EXECUTION:
-Translate ALL lines, without omitting anything. Make the translation smooth, impressive, and engaging. Start now.
+```bash
+# 1. Cài đặt dependencies Frontend
+npm install
 
+# 2. Chạy chế độ Development (Hot Reload)
+npm run tauri dev
 
-OEcJljTNROniXBOsjXh1INYQc9urzOKc
+# 3. Build ra file .exe (Production)
+npm run tauri build
+```
+
+## ⚙️ Hướng Dẫn Cấu Hình (Settings)
+
+*   **URL**: Endpoint của API (VD: `https://api.openai.com/v1` hoặc các dịch vụ Local/Proxy).
+*   **Key**: API Key.
+*   **Model**: Tên model (VD: `gpt-4`, `mistral-large`, `gemini-pro`).
+*   **System Prompt**: Chỉ thị cốt lõi cho AI (Role, Context, Font style...).
+*   **Threads**: Số lượng luồng dịch song song (Khuyên dùng: 2-5 tùy vào giới hạn API của bạn).
+*   **Batch**: Số dòng trong 1 gói xử lý (Khuyên dùng: 50-100).
+*   **Delay**: Thời gian nghỉ giữa các request (giây) để tránh bị chặn IP/Rate Limit.
+
+## 📂 Cấu Trúc File Output
+
+Trong quá trình chạy, Tool sẽ sinh ra các file tại thư mục gốc của ứng dụng:
+
+1.  **`config.json`**: Lưu cấu hình cá nhân (được load tự động khi mở app).
+2.  **`temp_translating.txt`**: File lưu tạm thời kết quả dịch. Dùng để backup.
+3.  **`thread.txt`**: Log ghi lại phân chia nhiệm vụ (VD: `Thread 1: 0-49`). Thứ tự trong file này luôn tăng dần để dễ tra cứu.
+4.  **`tran.txt`**: File kết quả cuối cùng (Chỉ sinh ra khi hoàn tất 100%).
+
+## 📝 Định Dạng File Dịch
+
+Tool nhận file đầu vào (`.txt`) có định dạng đặc biệt, thường là:
+```text
+ID:::Text Cần Dịch
+101:::Hello World
+102:::Attack
+```
+Kết quả trả về sẽ giữ nguyên ID:
+```text
+101:::Xin chào thế giới
+102:::Tấn công
+```
+
+## 💖 Credits
+Developed for Wuthering Waves Vietnamese Localization Project.
