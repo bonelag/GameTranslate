@@ -3,3 +3,4 @@ dist
 *.txt
 config.json
 package-lock.json
+*.exe

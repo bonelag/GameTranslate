@@ -394,7 +394,24 @@ async fn call_api_translate_with_result(
     thread_id: usize,
     total_in_chunk: usize,
 ) -> Result<Vec<String>, String> {
-    let prompt = lines.join("\n") + "\n\nREMINDER: Format 'ID:::TranslatedText'.";
+    // Filter for prompt: Only include lines with actual text content
+    let prompt_lines: Vec<&str> = lines.iter()
+        .filter(|line| {
+            if let Some((_, content)) = line.split_once(":::") {
+                !content.trim().is_empty()
+            } else {
+                !line.trim().is_empty()
+            }
+        })
+        .map(|s| s.as_str())
+        .collect();
+
+    // If no content to translate, return early
+    if prompt_lines.is_empty() {
+        return Ok(lines.to_vec());
+    }
+
+    let prompt = prompt_lines.join("\n") + "\n\nREMINDER: Format 'ID:::TranslatedText'.";
     
     let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
     
@@ -499,13 +516,21 @@ async fn call_api_translate_with_result(
 
     let mut new_results = Vec::new();
     for line in lines {
-        let id_part = line.split(":::").next().unwrap_or("").trim();
-        if !id_part.is_empty() {
-             if let Some(trans) = translated_map.get(id_part) {
-                 new_results.push(format!("{}:::{}", id_part, trans));
-             } else {
-                 new_results.push(line.clone());
-             }
+        if let Some((id, content)) = line.split_once(":::") {
+            let id = id.trim();
+            // CRITICAL FIX: If the source content is empty, force empty result. 
+            // Do not let AI hallucinate text for empty lines.
+            if content.trim().is_empty() {
+                new_results.push(line.clone());
+            } else if !id.is_empty() {
+                 if let Some(trans) = translated_map.get(id) {
+                     new_results.push(format!("{}:::{}", id, trans));
+                 } else {
+                     new_results.push(line.clone());
+                 }
+            } else {
+                new_results.push(line.clone());
+            }
         } else {
             new_results.push(line.clone());
         }
