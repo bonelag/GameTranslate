@@ -9,7 +9,8 @@
     "build": "vite build",
     "serve": "vite preview",
     "tauri": "tauri",
-    "clean": "cargo clean --manifest-path src-tauri/Cargo.toml"
+    "clean": "cargo clean --manifest-path src-tauri/Cargo.toml",
+    "build:exe": "tauri build --no-bundle"
   },
   "license": "MIT",
   "dependencies": {
