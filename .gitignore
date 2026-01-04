@@ -2,3 +2,4 @@ node_modules
 dist
 *.txt
 config.json
+package-lock.json
