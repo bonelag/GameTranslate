@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tauri::{AppHandle, Emitter};
 use std::time::{Duration, Instant};
 use std::io::Write;
@@ -95,6 +96,15 @@ fn get_path(filename: &str) -> PathBuf {
     let mut path = get_app_root();
     path.push(filename);
     path
+}
+
+fn log_thread_activity(thread_id: usize, start_id: &str, end_id: &str) {
+    let path = get_path("thread.txt");
+    let msg = format!("Thread {}: {}-{}\n", thread_id, start_id, end_id);
+    // Append or create
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = file.write_all(msg.as_bytes());
+    }
 }
 // ====================
 
@@ -197,6 +207,8 @@ pub async fn start_translation(
         let mut notify_guard = state.kill_notify.lock().map_err(|e| e.to_string())?;
         *notify_guard = kill_signal.clone();
     }
+    
+    let _ = std::fs::write(get_path("thread.txt"), "");
 
     let content = std::fs::read_to_string(&file_path).map_err(|e| e.to_string())?;
     let raw_lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
@@ -221,102 +233,139 @@ pub async fn start_translation(
         work_items.push((i, line.clone()));
     }
 
-    let total_items = work_items.len();
-    let num_threads = config.threads.max(1);
-    let chunk_size = (total_items as f64 / num_threads as f64).ceil() as usize;
+    let batch_size = config.batch_size.max(1);
+    let batches: Vec<Vec<(usize, String)>> = work_items.chunks(batch_size).map(|c| c.to_vec()).collect();
     
-    let chunks: Vec<Vec<(usize, String)>> = work_items.chunks(chunk_size).map(|c| c.to_vec()).collect();
+    let total_batches = batches.len();
+    let finished_batches = Arc::new(AtomicUsize::new(0));
     
     let stop_flag = state.stop_flag.clone();
     let rate_limiter = state.rate_limiter.clone();
     let config = Arc::new(config);
     let output_mutex = Arc::new(Mutex::new(initial_output));
     
-    let mut handles = vec![];
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(config.threads.max(1)));
+    let mut tasks = tokio::task::JoinSet::new();
 
-    for (thread_id, chunk) in chunks.into_iter().enumerate() {
+    // Initial Status
+    let _ = app.emit("progress", ProgressEvent {
+        thread_id: 0,
+        current: 0,
+        total: total_batches,
+        message: format!("Started. {} Batches.", total_batches),
+        append: false,
+    });
+    
+    // Dispatch batches
+    for (i, batch) in batches.into_iter().enumerate() {
+        let global_thread_id = i + 1; // Thread 1, 2, 3...
+        
+        // Wait for worker slot. This blocks until a thread is free.
+        let permit = semaphore.clone().acquire_owned().await.map_err(|e| e.to_string())?;
+        
+        let batch_len = batch.len();
+        let start_line_content = &batch.first().map(|x| x.1.clone()).unwrap_or_default();
+        let end_line_content = &batch.last().map(|x| x.1.clone()).unwrap_or_default();
+
+        let start_id = start_line_content.split(":::").next().unwrap_or("?").trim();
+        let end_id = end_line_content.split(":::").next().unwrap_or("?").trim();
+        
+        log_thread_activity(global_thread_id, start_id, end_id);
+
         let config = config.clone();
         let stop_flag = stop_flag.clone();
         let rate_limiter = rate_limiter.clone();
         let app_handle = app.clone();
         let output_mutex = output_mutex.clone();
         let kill_signal = kill_signal.clone();
+        let finished_batches = finished_batches.clone();
         
-        let handle = tokio::spawn(async move {
-            let thread_id = thread_id + 1;
-            let total_in_chunk = chunk.len();
-            let chunk_start_idx = chunk.first().map(|x| x.0).unwrap_or(0);
-            let chunk_end_idx = chunk.last().map(|x| x.0).unwrap_or(0);
+        let start_id_owned = start_id.to_string();
+        let end_id_owned = end_id.to_string();
+
+        tasks.spawn(async move {
+            let _permit = permit; // drop when finished
+            
+            if *stop_flag.lock().unwrap() { return; }
             
             let _ = app_handle.emit("progress", ProgressEvent {
-                thread_id,
+                thread_id: global_thread_id,
                 current: 0,
-                total: total_in_chunk,
-                message: format!("Ready. Range: {}-{}", chunk_start_idx, chunk_end_idx),
+                total: batch_len,
+                message: format!("Processing {}-{}", start_id_owned, end_id_owned),
                 append: false,
             });
 
             let client = reqwest::Client::new();
-            let mut processed = 0;
+            let batch_lines: Vec<String> = batch.iter().map(|(_, s)| s.clone()).collect();
+            let batch_indices: Vec<usize> = batch.iter().map(|(i, _)| *i).collect();
 
-            'batch_loop: for batch in chunk.chunks(config.batch_size) {
+            // Retry Loop
+            loop {
                 if *stop_flag.lock().unwrap() { break; }
-
+                
                 tokio::select! {
                     _ = rate_limiter.wait(config.delay) => {},
-                    _ = kill_signal.notified() => { break 'batch_loop; }
+                    _ = kill_signal.notified() => { break; }
                 }
 
-                let batch_lines: Vec<String> = batch.iter().map(|(_, s)| s.clone()).collect();
-                let batch_indices: Vec<usize> = batch.iter().map(|(i, _)| *i).collect();
-                
-                let translated = tokio::select! {
-                    res = call_api_translate(
+                let result = tokio::select! {
+                     res = call_api_translate_with_result(
                         &client, 
                         &config, 
                         &batch_lines, 
                         &app_handle, 
-                        thread_id,
-                        processed,
-                        total_in_chunk
-                    ) => res,
-                    _ = kill_signal.notified() => { break 'batch_loop; }
+                        global_thread_id,
+                        batch_len
+                     ) => res,
+                     _ = kill_signal.notified() => { break; }
                 };
-
-                {
-                    let mut out = output_mutex.lock().unwrap();
-                    for (idx, text) in batch_indices.iter().zip(translated.iter()) {
-                        out[*idx] = text.clone();
-                    }
-                    save_temp_file(&out);
-                }
                 
-                processed += batch.len();
-                let _ = app_handle.emit("progress", ProgressEvent {
-                    thread_id,
-                    current: processed,
-                    total: total_in_chunk,
-                    message: format!("Batch of {} done.", batch.len()), 
-                    append: false,
-                });
+                match result {
+                    Ok(translated) => {
+                        {
+                            let mut out = output_mutex.lock().unwrap();
+                            for (idx, text) in batch_indices.iter().zip(translated.iter()) {
+                                out[*idx] = text.clone();
+                            }
+                            save_temp_file(&out);
+                        }
+                         let _ = app_handle.emit("progress", ProgressEvent {
+                            thread_id: global_thread_id,
+                            current: batch_len,
+                            total: batch_len,
+                            message: "Done.".to_string(),
+                            append: false,
+                        });
+                        
+                        // Update Global Progress (Thread 0)
+                        let finished = finished_batches.fetch_add(1, Ordering::SeqCst) + 1;
+                        let _ = app_handle.emit("progress", ProgressEvent {
+                            thread_id: 0,
+                            current: finished,
+                            total: total_batches,
+                            message: format!("Progress: {}/{} Batches", finished, total_batches),
+                            append: false,
+                        });
+
+                        break; 
+                    }
+                    Err(e) => {
+                         let _ = app_handle.emit("progress", ProgressEvent {
+                            thread_id: global_thread_id,
+                            current: 0,
+                            total: batch_len,
+                            message: format!("Error: {}. Retrying...", e),
+                            append: true,
+                        });
+                        tokio::time::sleep(Duration::from_millis(1000)).await;
+                    }
+                }
             }
-            
-             if !*stop_flag.lock().unwrap() && processed >= total_in_chunk {
-                let _ = app_handle.emit("progress", ProgressEvent {
-                    thread_id,
-                    current: total_in_chunk,
-                    total: total_in_chunk,
-                    message: "Finished.".to_string(),
-                    append: false,
-                });
-             }
         });
-        handles.push(handle);
     }
 
-    for h in handles {
-        let _ = h.await;
-    }
+    while let Some(_) = tasks.join_next().await {}
 
     if !*state.stop_flag.lock().unwrap() {
         let final_lines = output_mutex.lock().unwrap();
@@ -325,20 +374,26 @@ pub async fn start_translation(
         for line in final_lines.iter() {
             writeln!(file, "{}", line).map_err(|e| e.to_string())?;
         }
+        let _ = app.emit("progress", ProgressEvent {
+            thread_id: 0,
+            current: total_batches,
+            total: total_batches,
+            message: "Finished.".to_string(),
+            append: false,
+        });
     }
 
     Ok(())
 }
 
-async fn call_api_translate(
+async fn call_api_translate_with_result(
     client: &reqwest::Client,
     config: &TranslatorConfig,
     lines: &[String],
     app: &AppHandle,
     thread_id: usize,
-    current_processed: usize,
     total_in_chunk: usize,
-) -> Vec<String> {
+) -> Result<Vec<String>, String> {
     let prompt = lines.join("\n") + "\n\nREMINDER: Format 'ID:::TranslatedText'.";
     
     let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
@@ -352,145 +407,109 @@ async fn call_api_translate(
         "stream": config.stream
     });
 
-    if let Some(t) = config.temperature {
-        payload["temperature"] = serde_json::json!(t);
-    }
-    if let Some(m) = config.max_tokens {
-        payload["max_tokens"] = serde_json::json!(m);
-    }
-    if let Some(p) = config.top_p {
-        payload["top_p"] = serde_json::json!(p);
-    }
-    if let Some(k) = config.top_k {
-        payload["top_k"] = serde_json::json!(k);
-    }
+    if let Some(t) = config.temperature { payload["temperature"] = serde_json::json!(t); }
+    if let Some(m) = config.max_tokens { payload["max_tokens"] = serde_json::json!(m); }
+    if let Some(p) = config.top_p { payload["top_p"] = serde_json::json!(p); }
+    if let Some(k) = config.top_k { payload["top_k"] = serde_json::json!(k); }
 
-    let mut result_lines = lines.to_vec();
-
-    let resp_res = client.post(&url)
+    let resp = client.post(&url)
         .header("Authorization", format!("Bearer {}", config.api_key))
         .json(&payload)
         .send()
-        .await;
+        .await
+        .map_err(|e| e.to_string())?;
 
-    match resp_res {
-        Ok(resp) => {
-            if !resp.status().is_success() {
-                let _ = app.emit("progress", ProgressEvent {
-                    thread_id,
-                    current: current_processed,
-                    total: total_in_chunk,
-                    message: format!("API Error: {}", resp.status()),
-                    append: true,
-                });
-                return result_lines;
-            }
+    if !resp.status().is_success() {
+        return Err(format!("API Status: {}", resp.status()));
+    }
 
-            let mut full_content = String::new();
+    let mut full_content = String::new();
 
-            if config.stream {
-                use futures_util::StreamExt;
-                let mut stream = resp.bytes_stream();
-                let mut buffer = Vec::new();
+    if config.stream {
+        use futures_util::StreamExt;
+        let mut stream = resp.bytes_stream();
+        let mut buffer = Vec::new();
 
-                while let Some(item) = stream.next().await {
-                    if let Ok(chunk) = item {
-                        buffer.extend_from_slice(&chunk);
-                        
-                        // Find the last newline to process complete messages
-                        if let Some(last_newline_idx) = buffer.iter().rposition(|&b| b == b'\n') {
-                            let complete_chunk = buffer.drain(..=last_newline_idx).collect::<Vec<u8>>();
-                            let s = String::from_utf8_lossy(&complete_chunk);
-                            
-                            for line in s.lines() {
-                                let line = line.trim();
-                                if line.starts_with("data: ") {
-                                    let data = &line[6..];
-                                    if data == "[DONE]" { break; }
-                                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                                        if let Some(content) = json["choices"][0]["delta"]["content"].as_str() {
-                                            full_content.push_str(content);
-                                            // Emit simplified log for monitor
-                                            let _ = app.emit("progress", ProgressEvent {
-                                                thread_id,
-                                                current: current_processed,
-                                                total: total_in_chunk,
-                                                message: content.to_string(),
-                                                append: true,
-                                            });
-                                        }
-                                    }
-                                }
-                            }
+        while let Some(item) = stream.next().await {
+            let chunk = item.map_err(|e| e.to_string())?;
+            buffer.extend_from_slice(&chunk);
+            
+            if let Some(last_newline_idx) = buffer.iter().rposition(|&b| b == b'\n') {
+                let complete_chunk = buffer.drain(..=last_newline_idx).collect::<Vec<u8>>();
+                let s = String::from_utf8_lossy(&complete_chunk);
+                
+                for line in s.lines() {
+                    let line = line.trim();
+                    if line.starts_with("data: ") {
+                        let data = &line[6..];
+                        if data == "[DONE]" { break; }
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                             if let Some(content) = json["choices"][0]["delta"]["content"].as_str() {
+                                 full_content.push_str(content);
+                                 let _ = app.emit("progress", ProgressEvent {
+                                    thread_id,
+                                    current: 0,
+                                    total: total_in_chunk,
+                                    message: content.to_string(),
+                                    append: true,
+                                 });
+                             }
                         }
                     }
                 }
-                
-                // Process remaining buffer if any (unlikely to be valid JSON if split, but good practice)
-                if !buffer.is_empty() {
-                     let s = String::from_utf8_lossy(&buffer);
-                     for line in s.lines() {
-                         let line = line.trim();
-                         if line.starts_with("data: ") {
-                              let data = &line[6..];
-                               if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                                    if let Some(content) = json["choices"][0]["delta"]["content"].as_str() {
-                                        full_content.push_str(content);
-                                    }
-                               }
-                         }
-                     }
-                }
-                
-            } else {
-                if let Ok(json) = resp.json::<serde_json::Value>().await {
-                    if let Some(content) = json["choices"][0]["message"]["content"].as_str() {
-                        full_content = content.to_string();
-                        let _ = app.emit("progress", ProgressEvent {
-                            thread_id,
-                            current: current_processed,
-                            total: total_in_chunk,
-                            message: format!("Received {} chars", full_content.len()),
-                            append: true,
-                        });
-                    }
-                }
             }
-
-            let translated_lines: Vec<&str> = full_content.trim().split('\n').collect();
-            let mut translated_map = std::collections::HashMap::new();
-            
-            for line in translated_lines {
-                if let Some((id, text)) = line.split_once(":::") {
-                    translated_map.insert(id.trim().to_string(), text.trim().to_string());
-                }
-            }
-
-            let mut new_results = Vec::new();
-            for line in lines {
-                let id_part = line.split(":::").next().unwrap_or("").trim();
-                if !id_part.is_empty() {
-                    if let Some(trans) = translated_map.get(id_part) {
-                        new_results.push(format!("{}:::{}", id_part, trans));
-                    } else {
-                        new_results.push(line.clone());
-                    }
-                } else {
-                    new_results.push(line.clone());
-                }
-            }
-            result_lines = new_results;
         }
-        Err(e) => {
+        
+        if !buffer.is_empty() {
+             let s = String::from_utf8_lossy(&buffer);
+             for line in s.lines() {
+                 let line = line.trim();
+                 if line.starts_with("data: ") {
+                    let data = &line[6..];
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                        if let Some(content) = json["choices"][0]["delta"]["content"].as_str() {
+                            full_content.push_str(content);
+                        }
+                    }
+                 }
+             }
+        }
+    } else {
+        let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+        if let Some(content) = json["choices"][0]["message"]["content"].as_str() {
+            full_content = content.to_string();
             let _ = app.emit("progress", ProgressEvent {
                 thread_id,
-                current: current_processed,
+                current: 0,
                 total: total_in_chunk,
-                message: format!("Exception: {}", e),
+                message: format!("Received {} chars", full_content.len()),
                 append: true,
             });
         }
     }
 
-    result_lines
+    let translated_lines: Vec<&str> = full_content.trim().split('\n').collect();
+    let mut translated_map = std::collections::HashMap::new();
+    
+    for line in translated_lines {
+        if let Some((id, text)) = line.split_once(":::") {
+            translated_map.insert(id.trim().to_string(), text.trim().to_string());
+        }
+    }
+
+    let mut new_results = Vec::new();
+    for line in lines {
+        let id_part = line.split(":::").next().unwrap_or("").trim();
+        if !id_part.is_empty() {
+             if let Some(trans) = translated_map.get(id_part) {
+                 new_results.push(format!("{}:::{}", id_part, trans));
+             } else {
+                 new_results.push(line.clone());
+             }
+        } else {
+            new_results.push(line.clone());
+        }
+    }
+
+    Ok(new_results)
 }

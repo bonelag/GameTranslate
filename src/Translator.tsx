@@ -356,10 +356,12 @@ export default function Translator() {
 
               return (
                 <div class="bg-gray-700/50 p-3 rounded flex items-center gap-3">
-                  <div class="w-24 text-xs font-mono text-gray-400 flex-none">Thread {threadId}</div>
+                  <div class={`w-24 text-xs font-mono flex-none ${threadId === 0 ? "text-green-400 font-bold" : "text-gray-400"}`}>
+                    {threadId === 0 ? "Progress" : `Thread ${threadId}`}
+                  </div>
                   <div class="flex-1 h-3 bg-gray-900 rounded-full overflow-hidden relative">
                     <div
-                      class="h-full bg-green-500 transition-all duration-300"
+                      class={`h-full transition-all duration-300 ${threadId === 0 ? "bg-blue-500" : "bg-green-500"}`}
                       style={{ width: `${p().total > 0 ? (p().current / p().total) * 100 : 0}%` }}
                     />
                   </div>
