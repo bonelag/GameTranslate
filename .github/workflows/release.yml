@@ -17,9 +17,9 @@ jobs:
           - platform: "macos-latest"
             args: "--target x86_64-apple-darwin --bundle"
           - platform: "ubuntu-22.04"
-            args: "--bundle"
+            args: "bundle"
           - platform: "windows-latest"
-            args: "--bundle"
+            args: "bundle"
 
     runs-on: ${{ matrix.platform }}
     steps:
