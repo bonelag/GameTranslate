@@ -7,6 +7,7 @@ name = "GameTranslate"
 version = "0.1.0"
 dependencies = [
  "futures-util",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

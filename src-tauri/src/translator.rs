@@ -505,14 +505,47 @@ async fn call_api_translate_with_result(
         }
     }
 
-    let translated_lines: Vec<&str> = full_content.trim().split('\n').collect();
+    // --- ROBUST PARSING LOGIC START ---
+    // Instead of simple split('\n'), we parse line by line and handle multi-line spills.
+    let raw_lines_out: Vec<&str> = full_content.split('\n').collect();
     let mut translated_map = std::collections::HashMap::new();
     
-    for line in translated_lines {
-        if let Some((id, text)) = line.split_once(":::") {
-            translated_map.insert(id.trim().to_string(), text.trim().to_string());
+    let mut current_id: Option<String> = None;
+    let mut current_text_buffer = String::new();
+
+    for line in raw_lines_out {
+        let trimmed = line.trim();
+        if trimmed.is_empty() { continue; }
+
+        // Check if line starts with ID:::
+        // Pattern: Starts with digits, then :::
+        let re_start = regex::Regex::new(r"^(\d+):::(.*)").unwrap();
+        
+        if let Some(caps) = re_start.captures(line) {
+            // FOUND NEW ID
+            // Save previous if exists
+            if let Some(cid) = current_id {
+                translated_map.insert(cid, current_text_buffer.trim().to_string());
+            }
+
+            // Start new
+            current_id = Some(caps[1].to_string());
+            current_text_buffer = caps[2].to_string();
+        } else {
+            // CONTINUATION LINE (AI added a newline)
+            // If we have an active ID, append this line to it using literal \n
+            if current_id.is_some() {
+                 current_text_buffer.push_str("\\n"); 
+                 current_text_buffer.push_str(trimmed);
+            }
         }
     }
+    
+    // Save last buffer
+    if let Some(cid) = current_id {
+        translated_map.insert(cid, current_text_buffer.trim().to_string());
+    }
+    // --- ROBUST PARSING LOGIC END ---
 
     let mut new_results = Vec::new();
     for line in lines {
@@ -526,6 +559,8 @@ async fn call_api_translate_with_result(
                  if let Some(trans) = translated_map.get(id) {
                      new_results.push(format!("{}:::{}", id, trans));
                  } else {
+                     // AI missed this ID? Check if strict matching failed or just not returned.
+                     // Fallback: keep original if translation missing
                      new_results.push(line.clone());
                  }
             } else {
