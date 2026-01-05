@@ -39,7 +39,7 @@ struct RateLimiter {
 impl RateLimiter {
     fn new() -> Self {
         Self {
-            last_request: Mutex::new(Instant::now().checked_sub(Duration::from_secs(3600)).unwrap()),
+            last_request: Mutex::new(Instant::now().checked_sub(Duration::from_secs(3600)).unwrap_or_else(Instant::now)),
         }
     }
 
@@ -233,8 +233,117 @@ pub async fn start_translation(
         work_items.push((i, line.clone()));
     }
 
-    let batch_size = config.batch_size.max(1);
-    let batches: Vec<Vec<(usize, String)>> = work_items.chunks(batch_size).map(|c| c.to_vec()).collect();
+    // === DYNAMIC BATCHING LOGIC ===
+    let batch_limit_size = config.batch_size.max(1);
+    let token_limit = 5000;
+    
+    let mut batches: Vec<Vec<(usize, String)>> = Vec::new();
+    let mut cursor = start_idx;
+    let total_lines = raw_lines.len();
+
+    // Helper: Estimate tokens (char count / 3.5 roughly for mixed content)
+    fn estimate_tokens(s: &str) -> usize {
+        let content = s.split_once(":::").map(|(_, c)| c).unwrap_or(s);
+        (content.len() as f64 / 3.5) as usize
+    }
+
+    // Helper: Check for bigram overlap (2 consecutive words)
+    // Returns true if s1 and s2 share at least one sequence of 2 words (ignoring punctuation/case)
+    fn has_context_overlap(s1: &str, s2: &str) -> bool {
+        fn extract_words(s: &str) -> Vec<String> {
+            let re = regex::Regex::new(r"[\w]+").unwrap();
+            let content = s.split_once(":::").map(|(_, c)| c).unwrap_or(s);
+            re.find_iter(content)
+              .map(|m| m.as_str().to_lowercase())
+              .collect()
+        }
+
+        let words1 = extract_words(s1);
+        let words2 = extract_words(s2);
+
+        if words1.len() < 2 || words2.len() < 2 { return false; }
+
+        let bigrams1: std::collections::HashSet<(String, String)> = words1
+            .windows(2)
+            .map(|w| (w[0].clone(), w[1].clone()))
+            .collect();
+
+        for w in words2.windows(2) {
+             if bigrams1.contains(&(w[0].clone(), w[1].clone())) {
+                 return true;
+             }
+        }
+        false
+    }
+
+    while cursor < total_lines {
+        // 1. Build "Core" Batch
+        let mut core_end = cursor; // Exclusive
+        let mut current_tokens = 0;
+        let mut current_lines = 0;
+
+        while core_end < total_lines {
+            let tokens = estimate_tokens(&raw_lines[core_end]);
+            
+            // Check limits. Allow slight overflow if it's the only line, 
+            // but generally stop if adding this line exceeds limit significantly.
+            // User requested < 200 diff, so we stop if we are already near 6000.
+            if current_tokens + tokens > token_limit && current_lines > 0 {
+                break;
+            }
+            if current_lines >= batch_limit_size {
+                break;
+            }
+
+            current_tokens += tokens;
+            current_lines += 1;
+            core_end += 1;
+        }
+        
+        // Ensure at least one line makes progress
+        if core_end == cursor { 
+            core_end += 1; 
+        }
+
+        // 2. Expand Backward (Context Lookback)
+        let mut actual_start = cursor;
+        let mut lookback_count = 0;
+        while lookback_count < 5 && actual_start > start_idx {
+            let prev = actual_start - 1;
+            let curr = actual_start;
+            if has_context_overlap(&raw_lines[prev], &raw_lines[curr]) {
+                actual_start = prev;
+                lookback_count += 1;
+            } else {
+                break;
+            }
+        }
+
+        // 3. Expand Forward (Context Lookahead)
+        let mut actual_end = core_end; // Exclusive
+        let mut lookahead_count = 0;
+        while lookahead_count < 5 && actual_end < total_lines {
+            let prev = actual_end - 1; // Last line of current selection
+            let curr = actual_end;     // Candidate to add
+            if has_context_overlap(&raw_lines[prev], &raw_lines[curr]) {
+                actual_end = curr + 1; // Include this line
+                lookahead_count += 1;
+            } else {
+                break;
+            }
+        }
+
+        // 4. Create Batch Output
+        let mut batch_items = Vec::new();
+        // map input index back to original raw_lines index
+        for i in actual_start..actual_end {
+            batch_items.push((i, raw_lines[i].clone()));
+        }
+        batches.push(batch_items);
+
+        // 5. Advance Cursor (By CORE amount only, to avoid infinite loops or skipping)
+        cursor = core_end; 
+    }
     
     let total_batches = batches.len();
     let finished_batches = Arc::new(AtomicUsize::new(0));
